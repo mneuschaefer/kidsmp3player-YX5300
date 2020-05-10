@@ -1,16 +1,9 @@
 
-  /*
-   * Problem: How to fill the Array for the number of Files, e.g.
-   * numberOfFiles[] = { 3, 5, 2, 7, 3, 2, 1, 6, 7}
-   * with mp3.queryFolderFiles() ??
-   */
-
- /********************************************************************************/
-/****************************** CONSTANTS ****************************************/
-/********************************************************************************/
-
-#include <MD_YX5300.h>
+  #include <MD_YX5300.h>
 //  https://github.com/MajicDesigns/MD_YX5300/
+#include <avr/sleep.h>
+#include <avr/eeprom.h>
+#include <EEPROM.h>
 
 
 // Connections for serial interface to the YX5300 module
@@ -20,7 +13,11 @@ const uint8_t ARDUINO_TX = 6;    // connect to RX of MP3 Player module
 // Constants for Buttons
 #define PIN_KEY A3
 #define BUTTON_TOLERANCE 25
-#define LONG_KEY_PRESS_TIME_MS 2000L
+#define LONG_KEY_PRESS_TIME_MS 1000
+
+#define PIN_VOLUME A5
+#define PIN_VOLUME_INTERNAL A0
+
 
 #define DEBUG 1 // enable/disable debug output
 
@@ -40,6 +37,51 @@ long int lastCheck;
 // Define global variables
 MD_YX5300 mp3(ARDUINO_RX, ARDUINO_TX);
 
+/************ Options **************************/
+#define DEV_TF            0X02
+
+#define EEPROM_CFG 1
+#define EEPROM_FOLDER 2
+#define EEPROM_TRACK 4
+
+
+
+/******* Status LED ********/
+#define LED_PIN 3
+#define LED_DELAY 2000
+bool ledIsOn = false;
+int brightness = 0;    // how bright the LED is
+int fadeAmount = 15;    // how many points to fade the LED by
+
+
+unsigned long lastLedChange;
+int ledBlinkPause = 200; //pause between blinks in MS
+
+// https://www.baldengineer.com/fading-led-analogwrite-millis-example.html
+// define directions for LED fade
+#define UP 0
+#define DOWN 1
+ 
+// constants for min and max PWM
+const int minPWM = 0;
+const int maxPWM = 40;
+ 
+// State Variable for Fade Direction
+byte fadeDirection = UP;
+ 
+// Global Fade Value
+// but be bigger than byte and signed, for rollover
+int fadeValue = 0;
+ 
+// How smooth to fade?
+byte fadeIncrement = 1;
+ 
+// millis() timing Variable, just for fading
+unsigned long previousFadeMillis;
+ 
+// How fast to increment? (more is slower)
+int fadeInterval = 30;
+
 /********************************************************************************/
 /****************************** VARIABLES (May change) **************************/
 /********************************************************************************/
@@ -47,16 +89,25 @@ MD_YX5300 mp3(ARDUINO_RX, ARDUINO_TX);
 /****** Folder Management *****/
 int numberOfFolders = 9;
 uint8_t currentFolder = 1; // start with folder 1
-unsigned int currentFile = 1; // FIXME change Type?
-unsigned int numberOfFiles[] = { 0, 0, 0, 0, 0, 0, 0, 0, 0}; // for 9 Folders
+unsigned int currentFile = 1; 
+int numberOfFiles[] = { -1, -1, -1, -1, -1, -1, -1, -1, -1}; // for 9 Folders
+bool folderCheckComplete = false; // flag if all folders are checked in setup
+bool foldersChecked[] = {false, false, false, false, false, false, false, false, false}; // for 9 folders
+
+long int lastChecked;
 int numberoffilesinfolder;
 /******************************/
 
 /****** Button Management *****/
 int key = -1;
+int button = -1; // replaces key #TODO
+ int newButtonPressed;
+ 
 unsigned long keyPressTimeMs = 0;
+int debounceDelay = 800;
 
 unsigned long nowMs;
+unsigned long startMs;
 
 int keyPressRepeats = 0; //???
 
@@ -67,10 +118,31 @@ boolean buttonActive = false;
 boolean longPressActive = false;
 // from https://www.instructables.com/id/Arduino-Dual-Function-Button-Long-PressShort-Press/
 
+
 enum {
   MODE_NORMAL, MODE_SET_TIMER
 } mode = MODE_NORMAL;
-/******************************/
+
+bool b_playing = false;
+
+// Timer
+unsigned long lastButtonEvent;
+unsigned long lastVolumeEvent;
+unsigned long lastEepromEvent;
+unsigned long lastStatusCheckEvent;
+unsigned long lastKeyPress;
+unsigned long lastLedEvent;
+unsigned long ledOffTime;
+int buttonToleranceMs = 800;
+
+
+/*********Volume*****************/
+
+float volFade = 1.0;
+int vol = -1;
+unsigned long volumeHandledLastMs = 0L;
+#define VOLUME_CHECK_INTERVAL_MS 300L
+
 
 /****** Status Information ****/
 enum playMode_t { M_SEQ, M_SHUFFLE, M_LOOP, M_EJECTED };
@@ -87,14 +159,10 @@ struct    // contains all the running status information
   playStatus_t playStatus;// playing status
   encMode_t encMode;      // encoder mode
   uint16_t numTracks;     // number of tracks in this folder
-  int16_t curTrack;       // current track being played
+  uint16_t curTrack;       // current track being played
   uint16_t volume;        // the current audio volume
 } S;
 /**************************/
-
-/********************************************************************************/
-/****************************** FUNCTIONS ******************************************/
-/********************************************************************************/
 
 /********** Initialize MP3 Data ************/
 bool initData(bool reset = false)
@@ -148,7 +216,6 @@ bool initData(bool reset = false)
 
   return(b);
 }
-/******************************/
 
 /**********Select next song ***********/
 void selectNextSong(int direction = 0)
@@ -178,8 +245,6 @@ void selectNextSong(int direction = 0)
   }
   mp3.queryFile();    // force index the update in callback
 }
-/******************************/
-
 
 /************ Callback Response *********/
 void cbResponse(const MD_YX5300::cbData *status)
@@ -215,8 +280,34 @@ void cbResponse(const MD_YX5300::cbData *status)
   case MD_YX5300::STS_FLDR_FILES: // number of files in the folder
     PRINTS("STS_FLDR_FILES"); 
     S.numTracks = status->data;
-    S.needUpdate = true;
-     numberOfFiles[currentFolder-1] = S.numTracks; // #FIXME - Data type / Conversion Problem ??
+    delay(300); // maybe remove #TODO
+
+    // if you get some file number data, add it to numberOfFiles array
+     numberOfFiles[currentFolder-1] = S.numTracks;
+     
+      // confirming that folder was queried
+      if (numberOfFiles[currentFolder-1] > -1) {
+        foldersChecked[currentFolder - 1] = true;
+        //Serial.println("");
+        //Serial.print("***** # in Folder +"); Serial.print(currentFolder); Serial.print(" is "); Serial.print(numberOfFiles[currentFolder-1]); Serial.println(" *****"); Serial.println("");
+        //Serial.println("current folder has been checked");
+        }
+
+
+      /*
+      if (!folderCheckComplete) {
+        Serial.println(""); Serial.print("checking Folder Nr. "); Serial.println(currentFolder);
+        if (foldersChecked[0] == true && foldersChecked[1]  == true && foldersChecked[2]  == true && 
+            foldersChecked[3]  == true && foldersChecked[4]  == true && foldersChecked[5]  == true && 
+            foldersChecked[6]  == true && foldersChecked[7]  == true && foldersChecked[8]  == true ) {
+          folderCheckComplete = true;  Serial.println("Folder check complete");
+          } else if (foldersChecked[currentFolder-1]){
+            Serial.println(""); Serial.print("***** # in Folder +"); Serial.print(currentFolder); Serial.print(" is "); Serial.print(numberOfFiles[currentFolder-1]); Serial.println(" *****"); Serial.println("");
+            Serial.println("current folder has been checked");
+            }
+      } */
+      
+      S.needUpdate = true;
     break;
 
   // unhandled cases
@@ -234,8 +325,6 @@ void cbResponse(const MD_YX5300::cbData *status)
   PRINTX(", 0x", status->data);
   S.waiting = false;
 }
-/******************************/
-
 
 void processPause(bool b)
 // switches pause on if b == true; of if b == false
@@ -252,131 +341,288 @@ void setVolume(int volume){
 
 
 
-void increaseVolume();
-void decreaseVolume();
-
-/******************************/
-/******************************/
-
-/******************************/
-/******************************/
-
-/******************************/
-/******************************/
-
 /****** Handle Button Presses *****/
-// Check for Key Press and Do Something
-inline void handleKeyPress() {
-  int keyCurrent = analogRead(PIN_KEY);
- 
 
-   if (keyCurrent <= 958) {
-    int keyOld = key;
-    if (keyCurrent > 933 - BUTTON_TOLERANCE) {
-      key = 11;
-      // Do Something
-      Serial.print("key = 11 ");
+
+inline void handleVolume() {
+  //Serial.println("Volume = " + String(vol));
+  if (nowMs > volumeHandledLastMs + VOLUME_CHECK_INTERVAL_MS) {
+    volumeHandledLastMs = nowMs;
+
+    int volCurrent = analogRead(PIN_VOLUME);
+    // int volInternal = analogRead(PIN_VOLUME_INTERNAL);
+    // removed vol internal
+    //int volNew = (map(volCurrent, 0, 1023, 1, 31 - map(volInternal, 1023, 0, 1, 30))) ;
+        int volNew = (map(volCurrent, 0, 1023, 1, 31)) ;
+
+    if (volNew != vol) {
+      vol = volNew;
+
+ S.volume = (vol);
+      mp3.volume(S.volume);
       
-    } else if (keyCurrent > 846 - BUTTON_TOLERANCE) {
-      key = 9;
-      // Do Something
-      Serial.print("key = 9 ");
-    } else if (keyCurrent > 760 - BUTTON_TOLERANCE) {
-      key = 6;
-      // Do Something
-      Serial.print("key = 6 ");
-    } else if (keyCurrent > 676 - BUTTON_TOLERANCE) {
-      key = 3;
-            Serial.print("key = 3 ");
-            
-            mp3.playSpecific(currentFolder, currentFile);
-    } else if (keyCurrent > 590 - BUTTON_TOLERANCE) {
-      key = 2;
-            Serial.print("key = 2 ");
-            
-    } else if (keyCurrent > 504 - BUTTON_TOLERANCE) {
-      key = 5;
-            Serial.print("key = 5 ");
-    } else if (keyCurrent > 414 - BUTTON_TOLERANCE) {
-      key = 8;
-            Serial.print("key = 8 ");
-    } else if (keyCurrent > 321 - BUTTON_TOLERANCE) {
-      key = 10;
-            Serial.print("key = 10 ");
-    } else if (keyCurrent > 222 - BUTTON_TOLERANCE) {
-      key = 7;
-            Serial.print("key = 7 ");
-    } else if (keyCurrent > 115 - BUTTON_TOLERANCE) {
-      key = 4;
-            Serial.print("key = 4 ");
-    } else if (keyCurrent > 0) {
-
-      // key 1 pressed
-      key = 1;
-        Serial.print("key = 1"); 
-
-        currentFolder = 1;
-        mp3.playSpecific(currentFolder, currentFile);
-    } 
-
-     currentFolder = key;
-     currentFile = 1;
-     mp3.playSpecific(currentFolder, currentFile);
-     
-    if (keyOld != key) {
-     keyPressTimeMs = nowMs;
-    } 
-  } else { 
-    //  if no keys pressed
-       
-      }
+      setVolume(vol);
+     // EEPROM.write(2, vol);
+  }
+  }
 }
-/******************************/
 
-/********************************************************************************/
-/****************************** SETUP ******************************************/
-/********************************************************************************/
+/************************* Button press ********************************/
+
+// Prueft welcher Knopf gedrueckt wurde
+// returns int for button, -1 if no button pressed
+int checkButtonPressed() {
+  int value = 1000;
+  value = analogRead(PIN_KEY);
+  if (debounce() == true) {
+  if (value > 990) return -1;
+  if (value > 933 - BUTTON_TOLERANCE) {
+    Serial.println("Button 11 pressed");
+    return 11;}
+  if (value > 846 - BUTTON_TOLERANCE) {
+    Serial.println("Button 9 pressed");
+    return 9;}
+  if (value > 760 - BUTTON_TOLERANCE) {
+    Serial.println("Button 6 pressed");
+    return 6;}
+  if (value > 676 - BUTTON_TOLERANCE) {
+    Serial.println("Button 3 pressed");
+    return 3;}
+  if (value > 590 - BUTTON_TOLERANCE) {
+    Serial.println("Button 2 pressed");
+    return 2;}
+  if (value > 504 - BUTTON_TOLERANCE) {
+    Serial.println("Button 5 pressed");
+    return 5;}
+  if (value > 414 - BUTTON_TOLERANCE) {
+    Serial.println("Button 8 pressed");
+    return 8;}
+  if (value > 321 - BUTTON_TOLERANCE) {
+    Serial.println("Button 10 pressed");
+    return 10;}
+  if (value > 222 - BUTTON_TOLERANCE) {
+    Serial.println("Button 7 pressed");
+    return 7;}
+  if (value > 115 - BUTTON_TOLERANCE) {
+    Serial.println("Button 4 pressed");
+    return 4;}
+  if (value > 0 ) {
+    Serial.println("Button 1 pressed");
+    return 1;}
+  } else return -1;
+}
+
+void saveSongAndPositionInEeprom(){
+ 
+    EEPROM.write(0, currentFolder);
+    EEPROM.write(1, currentFile);
+    EEPROM.write(2, vol);
+ 
+ // EEPROMWriteLong(2, filePosition);
+  lastEepromEvent = millis();
+}
+
+void loadPreviouslyPlayedSong(){
+  int folderFromEeprom = EEPROM.read(0);
+  int fileFromEeprom = EEPROM.read(1);
+  int volFromEeprom = EEPROM.read(2);
+  if (folderFromEeprom<=0 || fileFromEeprom<=0 || folderFromEeprom>10 || volFromEeprom>30){
+    return;
+  }
+  currentFolder = folderFromEeprom;
+  currentFile = fileFromEeprom;
+  vol = volFromEeprom;
+  //filePosition = EEPROMReadLong(2);
+}
+
+void doTheFadeUp(unsigned long thisMillis) {
+   if (thisMillis - lastLedEvent >= fadeInterval) {
+     fadeValue = fadeValue + fadeIncrement;  
+      if (fadeValue >= maxPWM) {
+        // At max, limit and change direction
+        fadeValue = maxPWM;
+        ledIsOn = true;
+      }
+      analogWrite(LED_PIN, fadeValue);  
+ 
+    // reset millis for the next iteration (fade timer only)
+    lastLedEvent = thisMillis;
+   }
+  }
+
+  void doTheFadeDown(unsigned long thisMillis) {
+   if (thisMillis - lastLedEvent >= fadeInterval) {
+       fadeValue = fadeValue - fadeIncrement;
+      if (fadeValue <= minPWM) {
+        
+        // At min, limit and change direction
+        fadeValue = minPWM;
+        //fadeDirection = UP;
+        ledIsOn = false;
+      }
+      analogWrite(LED_PIN, fadeValue);  
+ 
+    // reset millis for the next iteration (fade timer only)
+    lastLedEvent = thisMillis;
+  }
+  }
 
 
-void setup() {
+// check buttons, returns true if button was pressed
+boolean checkAndSetButtonPressed() { //#change #here
+  
+  // if no button was pressed: false
+  if (newButtonPressed == -1 ){
+    return false;
+  }
+  
+  // if button = currentFolder: continue to next song
+  if (currentFolder == newButtonPressed) {
+    // next song
+    playNextSong();
+  }
+  
+  // if Button = 10: play pause or continue
+  if (newButtonPressed == 10){
+    pauseUnpause();
+  }
+
+  // if button = 11: reset currentFile to 1
+   if (newButtonPressed == 11){
+    currentFile = 1;
+    b_playing = true; mp3.playSpecific(currentFolder, currentFile);
+    // 
+    return true;
+   }
+  button = newButtonPressed;
+  currentFolder = newButtonPressed;
+  currentFile = 1;
+  lastButtonEvent = nowMs;
+
+  // saves current song position in eeprom
+  saveSongAndPositionInEeprom();
+  
+  return true;
+}
+
+void playNextSong(){
+   Serial.println("next Track"); delay(50);
+        currentFile++; 
+        if (currentFile > numberOfFiles[currentFolder-1]) {currentFile = 1;}
+         b_playing = true; mp3.playSpecific(currentFolder, currentFile);
+  }
+
+bool debounce(){
+  if (millis() - lastButtonEvent < debounceDelay) {
+    lastButtonEvent = nowMs;
+    return true;
+    } else return false;
+  }
+  
+void pauseUnpause(){
+//return nextPreviousSong(newButtonPressed); //change
+      // mp3.playPause(); #CHECK #TODO
+      if (b_playing == false) {
+      mp3.playStart();
+      b_playing = true;
+      } else {
+        mp3.playPause(); 
+        S.playStatus = S_PAUSED; 
+        b_playing = false;
+        } 
+        //delay(50);
+  
+}
+
+
+void controlLed(){
+  if (!b_playing) {analogWrite(LED_PIN, maxPWM);} else {
+  
+    if ((millis() - lastLedChange) > 0 && !ledIsOn &&
+    ((millis() - ledOffTime) > ledBlinkPause)) {
+      // led stays off for 1 secons
+      lastLedChange = millis();
+      doTheFadeUp(nowMs);
+       }
+    if ((millis() - lastLedChange) > 0 && ledIsOn) {
+      lastLedChange = millis();
+      doTheFadeDown(nowMs);
+      if (!ledIsOn){ledOffTime = nowMs;}  
+      }
+    }  
+}
+
+
+void setup(){
 
 #if DEBUG
   Serial.begin(9600);
 #endif
   PRINTS("\n[MD_YX5300 Test]");
 
+
+  // Volume (Potis)
+  pinMode(PIN_VOLUME, INPUT);
+  pinMode(PIN_VOLUME_INTERNAL, INPUT);
+
   // Initialize global libraries
   mp3.begin();
+    
   mp3.setSynchronous(true);
   mp3.setCallback(cbResponse);
-  S.initialising = initData(true);  // initialize data from MP3 device
+  //S.initialising = initData(true);  // initialize data from MP3 device
   // Returns true if the initilisation must keep going, fails when completed.
+//S.playMode = M_LOOP;
 
-  /*** buttons ***/
+
+ pinMode(LED_PIN, fadeValue);
+  
+ /** buttons ***/
   pinMode(PIN_KEY, INPUT_PULLUP);
+   
     
   Serial.print("Buttons ready");
+long int lastChecked = millis() - 50;
 
-
+// load previous song from eeprom
+loadPreviouslyPlayedSong();
+ 
+   nowMs = millis();
+   lastLedEvent = nowMs;
+   ledOffTime = nowMs;
+     lastKeyPress= nowMs;
+   startMs = nowMs;
   
 }
 
-
-  
-/********************************************************************************/
-/****************************** LOOP ******************************************/
-/********************************************************************************/
 void loop() {
-  long int nowMs = millis();
   
-  
-  mp3.check();        // run the mp3 receiver   
-  if (S.initialising && !S.waiting) S.initialising = initData();
+  nowMs = millis();
+  mp3.check();        // run the mp3 receiver  
+  handleVolume(); 
+
+  if (S.initialising && !S.waiting) {S.initialising = initData();}
   // initialize if waiting
-  else {
-    // check buttons, act on key press
-    handleKeyPress(); 
+  
+  // every  300Ms, queryFolderFiles for the current folder
+  // Problem: checks only current folder, creates lag when choosing new folder #FIXME
+  if ((nowMs - lastChecked) > 300){ 
+    if(numberOfFiles[currentFolder-1] < 0) {
+      mp3.queryFolderFiles(currentFolder);
+      delay(200);
+      }
+    lastChecked = nowMs;
   }
+
+  //check for new button pressed
+  // (only updates if debounce() == true // debounceDelay
+  newButtonPressed = checkButtonPressed();
+
+   // once the folders are checked, react to buttons
+  if(foldersChecked) checkAndSetButtonPressed();
   
-  
+  // update LED (blinks when playing, pulses when not)
+  controlLed();
+
 }
+  
