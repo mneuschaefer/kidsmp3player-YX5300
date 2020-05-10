@@ -292,20 +292,6 @@ void cbResponse(const MD_YX5300::cbData *status)
         //Serial.print("***** # in Folder +"); Serial.print(currentFolder); Serial.print(" is "); Serial.print(numberOfFiles[currentFolder-1]); Serial.println(" *****"); Serial.println("");
         //Serial.println("current folder has been checked");
         }
-
-
-      /*
-      if (!folderCheckComplete) {
-        Serial.println(""); Serial.print("checking Folder Nr. "); Serial.println(currentFolder);
-        if (foldersChecked[0] == true && foldersChecked[1]  == true && foldersChecked[2]  == true && 
-            foldersChecked[3]  == true && foldersChecked[4]  == true && foldersChecked[5]  == true && 
-            foldersChecked[6]  == true && foldersChecked[7]  == true && foldersChecked[8]  == true ) {
-          folderCheckComplete = true;  Serial.println("Folder check complete");
-          } else if (foldersChecked[currentFolder-1]){
-            Serial.println(""); Serial.print("***** # in Folder +"); Serial.print(currentFolder); Serial.print(" is "); Serial.print(numberOfFiles[currentFolder-1]); Serial.println(" *****"); Serial.println("");
-            Serial.println("current folder has been checked");
-            }
-      } */
       
       S.needUpdate = true;
     break;
