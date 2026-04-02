@@ -1,4 +1,4 @@
-# kidsmp3player-YX5300
+# Kids' MP3 player
 Building a Kids mp3 Player (Hörbert-inspired) with arduino and YX5300 audio chip
 
 > [!NOTE]
